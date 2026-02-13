@@ -192,11 +192,26 @@ class PDFForgeryChecker:
 
     def check_incremental_updates(self) -> Tuple[int, Optional[str]]:
         try:
-            with open(self.pdf_path, "rb") as f:
-                data = f.read()
-                eof_count = data.count(b"%%EOF")
-                if eof_count > 1:
-                    return 5, "incremental_updates"
+            eof_count = self.raw_data.count(b"%%EOF")
+
+            # Check for suspicious patterns, not just multiple EOFs
+            # Multiple updates are normal, but check for anomalies
+            if eof_count > 3:  # More lenient threshold
+                # Additional checks for truly suspicious updates
+                xref_count = self.raw_data.count(b"xref")
+                trailer_count = self.raw_data.count(b"trailer")
+
+                # If xref/trailer counts don't match EOF, something's wrong
+                if (
+                    abs(xref_count - eof_count) > 1
+                    or abs(trailer_count - eof_count) > 1
+                ):
+                    return 7, "suspicious_incremental_updates"
+
+                # Many updates but structure seems ok - lower score
+                if eof_count > 5:
+                    return 4, "excessive_incremental_updates"
+
             return 0, None
         except Exception:
             return 0, None
@@ -204,13 +219,22 @@ class PDFForgeryChecker:
     def check_embedded_files_scripts(self) -> Tuple[int, Optional[str]]:
         try:
             root = self.reader.trailer["/Root"]
-            names = root.get("/Names", {})
+            if hasattr(root, "get_object"):
+                root = root.get_object()
+
+            names = root.get("/Names") if isinstance(root, dict) else None
+            if names and hasattr(names, "get_object"):
+                names = names.get_object()
+
             has_embedded = isinstance(names, dict) and "/EmbeddedFiles" in names
 
             has_js = False
-            if "/OpenAction" in root:
+            if isinstance(root, dict) and "/OpenAction" in root:
                 try:
                     action = root["/OpenAction"]
+                    if hasattr(action, "get_object"):
+                        action = action.get_object()
+
                     if isinstance(action, dict) and (
                         action.get("/S") == "/JavaScript" or "/JS" in action
                     ):
@@ -233,30 +257,44 @@ class PDFForgeryChecker:
             for page_num in range(len(self.doc)):
                 page = self.doc[page_num]
                 blocks = page.get_text("dict").get("blocks", [])
+
+                # Validate blocks have text content
                 text_blocks = [
-                    (fitz.Rect(b["bbox"]), b) for b in blocks if b.get("type") == 0
+                    (fitz.Rect(b["bbox"]), b)
+                    for b in blocks
+                    if b.get("type") == 0 and b.get("lines")  # Check has text
                 ]
-                overlaps_on_page = 0
+
                 overlaps_data = []
+                seen_pairs = set()  # Track processed pairs
 
-                for (r1, b1), (r2, b2) in combinations(text_blocks, 2):
-                    if r1.intersects(r2):
-                        intersection = r1 & r2
-                        if intersection.get_area() > 10:
-                            overlaps_on_page += 1
-                            text1 = self._extract_text_from_block(b1)
-                            text2 = self._extract_text_from_block(b2)
-                            if text1 and text2:
-                                overlap_result = self._find_overlapping_text(
-                                    text1, text2
-                                )
-                                if overlap_result:
-                                    overlaps_data.append(overlap_result)
+                for i, (r1, b1) in enumerate(text_blocks):
+                    for j, (r2, b2) in enumerate(text_blocks[i + 1 :], i + 1):
+                        pair_key = (i, j)
+                        if pair_key in seen_pairs:
+                            continue
 
-                if overlaps_on_page > 0:
+                        if r1.intersects(r2):
+                            intersection = r1 & r2
+                            # Make threshold relative to smaller block
+                            min_area = min(r1.get_area(), r2.get_area())
+                            if intersection.get_area() > min_area * 0.1:  # 10% overlap
+                                text1 = self._extract_text_from_block(b1)
+                                text2 = self._extract_text_from_block(b2)
+                                if (
+                                    text1 and text2 and text1 != text2
+                                ):  # Avoid duplicates
+                                    overlap_result = self._find_overlapping_text(
+                                        text1, text2
+                                    )
+                                    if overlap_result:
+                                        overlaps_data.append(overlap_result)
+                                        seen_pairs.add(pair_key)
+
+                if overlaps_data:  # Changed from overlaps_on_page
                     pages_with_overlaps.append(page_num + 1)
                     page_overlap_content[str(page_num + 1)] = overlaps_data
-                    total_overlaps += overlaps_on_page
+                    total_overlaps += len(overlaps_data)  # Count actual overlaps found
 
             warning = None
             if pages_with_overlaps:
