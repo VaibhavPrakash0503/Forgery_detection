@@ -80,44 +80,77 @@ class PDFForgeryChecker:
             creation = metadata.get("/CreationDate", "N/A")
             mod = metadata.get("/ModDate", "N/A")
 
-            if creation != "N/A" and mod != "N/A" and creation[:16] != mod[:16]:
-                return 2, "metadata"
-            elif mod == "N/A":
-                return 0, "No Modification Date"
-            elif creation == "N/A":
-                return 0, "No Creation Date"
-            return 0, None
+            # Both dates missing
+            if creation == "N/A" and mod == "N/A":
+                return 3, "No creation and modification dates"
+
+            # Only creation date missing
+            if creation == "N/A" and mod != "N/A":
+                return 2, "No creation date"
+
+            # Only modification date missing
+            if creation != "N/A" and mod == "N/A":
+                return 1, "No modification date"
+
+            # Both dates exist - check if they're identical (suspicious)
+            if creation != "N/A" and mod != "N/A":
+                # Compare first 14 chars (YYYYMMDDHHmmss) - exact same timestamp
+                if creation[:14] == mod[:14]:
+                    return 2, "Creation and modification dates are identical"
+
+            # Both dates exist and different (normal)
+            return 3, None
+
         except Exception:
             return 0, None
 
     def check_page_deletion(self) -> Tuple[int, Optional[str]]:
         try:
-            # Check for page number inconsistencies
-            page_labels = []
+            suspicion = 0
+            messages = []
+
+            # Get actual page count
+            actual_page_count = len(self.reader.pages)
+
+            # Check XRef table for freed/deleted objects
+            if hasattr(self.reader, "xref"):
+                deleted_objects = 0
+                for entry in self.reader.xref.values():
+                    if (
+                        hasattr(entry, "type") and entry.type == 0
+                    ):  # Type 0 = freed object
+                        deleted_objects += 1
+
+                if deleted_objects > 0:
+                    suspicion += 4
+                    messages.append(
+                        f"Found {deleted_objects} deleted objects in XRef table"
+                    )
+
+            # Check for gaps in page object numbers
+            page_objects = []
             for page in self.reader.pages:
-                if "/Labels" in page:
-                    page_labels.append(page["/Labels"])
+                if hasattr(page, "indirect_reference"):
+                    page_objects.append(page.indirect_reference.idnum)
 
-            # Check if page numbers are sequential
-            if len(page_labels) > 1:
-                try:
-                    numbers = [int(label) for label in page_labels if label.isdigit()]
-                    if numbers != list(range(min(numbers), max(numbers) + 1)):
-                        return 3, "page_number_inconsistency"
-                except ValueError:
-                    pass
+            if page_objects:
+                page_objects.sort()
+                gaps = sum(
+                    1
+                    for i in range(len(page_objects) - 1)
+                    if page_objects[i + 1] - page_objects[i] > 1
+                )
+                if gaps > actual_page_count * 0.05:  # More than 5% gaps
+                    suspicion += 5
+                    messages.append(
+                        f"Unusual gaps in page object numbering ({gaps} gaps)"
+                    )
 
-            # Check for missing referenced pages
-            root = self.reader.trailer["/Root"]
-            if isinstance(root, dict) and "/PageLabels" in root:
-                declared_pages = set(root["/PageLabels"].keys())
-                actual_pages = set(str(i + 1) for i in range(len(self.reader.pages)))
-                if declared_pages - actual_pages:
-                    return 4, "missing_referenced_pages"
+            message = "; ".join(messages) if messages else None
+            return suspicion, message
 
-            return 0, None
-        except Exception:
-            return 0, None
+        except Exception as e:
+            return 0, f"Error checking page deletion: {str(e)}"
 
     def check_page_structure(self) -> Tuple[int, Optional[str]]:
         try:
@@ -464,12 +497,41 @@ class PDFForgeryChecker:
     def check_fonts(self) -> Tuple[int, Optional[str]]:
         try:
             font_sets = []
-            for page in self.doc:
-                fonts = set(font[3] for font in page.get_fonts())
-                font_sets.append(frozenset(fonts))
+            font_counts = {}
 
-            if len(set(font_sets)) > 1:
-                return 1, "inconsistent_fonts"
+            for page in self.doc:
+                fonts = [font[3] for font in page.get_fonts()]
+                font_sets.append(frozenset(fonts))
+                for font in fonts:
+                    font_counts[font] = font_counts.get(font, 0) + 1
+
+            # Check for rare fonts (used on only 1-2 pages)
+            rare_fonts = [
+                f
+                for f, count in font_counts.items()
+                if count <= 2 and len(self.doc) > 5
+            ]
+
+            if rare_fonts and len(rare_fonts) > 2:
+                return (
+                    2,
+                    f"Suspicious rare fonts found: {len(rare_fonts)} fonts used on ≤2 pages",
+                )
+
+            # Check if one page has dramatically different fonts
+            if len(font_sets) > 1:
+                font_set_counts = {}
+                for fs in font_sets:
+                    key = frozenset(fs)
+                    font_set_counts[key] = font_set_counts.get(key, 0) + 1
+
+                # If one page has unique font set
+                unique_pages = sum(
+                    1 for count in font_set_counts.values() if count == 1
+                )
+                if unique_pages > 0 and len(self.doc) > 3:
+                    return 1, f"{unique_pages} page(s) with unique font combinations"
+
             return 0, None
         except Exception:
             return 0, None
@@ -481,11 +543,31 @@ class PDFForgeryChecker:
                 if hasattr(page, "indirect_reference") and page.indirect_reference:
                     ids.append(page.indirect_reference.idnum)
 
-            if ids and ids != sorted(ids):
-                return 1, "page_object_disorder"
+            if not ids:
+                return 0, None
+
+            # Check for reversed or significantly scrambled order
+            sorted_ids = sorted(ids)
+
+            # Calculate how many positions are "wrong"
+            mismatches = sum(1 for i, id in enumerate(ids) if id != sorted_ids[i])
+            mismatch_ratio = mismatches / len(ids)
+
+            # Only flag if significantly disordered (>30% out of order)
+            if mismatch_ratio > 0.3:
+                return (
+                    2,
+                    f"Page objects significantly out of order ({int(mismatch_ratio * 100)}% mismatched)",
+                )
+            elif mismatch_ratio > 0.1:
+                return (
+                    1,
+                    f"Some page object disorder detected ({int(mismatch_ratio * 100)}% mismatched)",
+                )
+
             return 0, None
         except Exception:
-            return 1, "object_order_check_failed"
+            return 0, None
 
     def check_annotations_and_forms(self) -> Tuple[int, Optional[str]]:
         try:
@@ -516,6 +598,93 @@ class PDFForgeryChecker:
             self.doc.close()
         except Exception:
             pass
+
+    def detect_text_modifications(self) -> Tuple[int, Optional[str]]:
+        """Detect signs of text being added or modified after document creation"""
+        try:
+            suspicious_pages = []
+            indicators = []
+
+            for page_num in range(len(self.doc)):
+                page = self.doc[page_num]
+                blocks = page.get_text("dict").get("blocks", [])
+
+                font_data = []
+
+                for block in blocks:
+                    if block.get("type") == 0:  # Text block
+                        for line in block.get("lines", []):
+                            for span in line.get("spans", []):
+                                font_data.append(
+                                    {
+                                        "font": span.get("font", ""),
+                                        "size": span.get("size", 0),
+                                        "color": span.get("color", 0),
+                                    }
+                                )
+
+                if len(font_data) < 2:
+                    continue
+
+                # Extract fonts and sizes
+                fonts = [f["font"] for f in font_data]
+                sizes = [f["size"] for f in font_data if f["size"] > 0]
+                colors = [f["color"] for f in font_data]
+
+                page_suspicious = False
+
+                # Check 1: Font diversity (lowered threshold)
+                unique_fonts = set(fonts)
+                if len(unique_fonts) > 3:  # Changed from 4
+                    page_suspicious = True
+                    indicators.append(
+                        f"Page {page_num + 1}: {len(unique_fonts)} different fonts"
+                    )
+
+                # Check 2: Single-use fonts (very suspicious for edits)
+                font_counts = {}
+                for font in fonts:
+                    font_counts[font] = font_counts.get(font, 0) + 1
+
+                single_use_fonts = [f for f, count in font_counts.items() if count == 1]
+                if len(single_use_fonts) >= 1:  # Even 1 single-use font is suspicious
+                    page_suspicious = True
+                    indicators.append(
+                        f"Page {page_num + 1}: Font used only once (likely added text)"
+                    )
+
+                # Check 3: Font size variance
+                if len(sizes) > 3:
+                    avg_size = sum(sizes) / len(sizes)
+                    # Check for ANY size that differs significantly
+                    for size in sizes:
+                        if abs(size - avg_size) > avg_size * 0.30:  # Lowered from 0.4
+                            page_suspicious = True
+                            indicators.append(
+                                f"Page {page_num + 1}: Inconsistent font size detected"
+                            )
+                            break
+
+                # Check 4: Color inconsistencies (added text often has different color value)
+                unique_colors = set(colors)
+                if len(unique_colors) > 2:  # More than 2 colors
+                    page_suspicious = True
+                    indicators.append(f"Page {page_num + 1}: Multiple text colors")
+
+                if page_suspicious:
+                    suspicious_pages.append(page_num + 1)
+
+            if suspicious_pages:
+                suspicion = min(
+                    len(suspicious_pages) * 2, 6
+                )  # 2 points per page, max 6
+                message = f"Text modifications detected on page(s) {suspicious_pages}: {'; '.join(set(indicators))}"
+                return suspicion, message
+
+            return 0, None
+
+        except Exception as e:
+            return 0, None
 
     def analyze(self, filename: str) -> ForgeryStatus:
         try:
@@ -573,6 +742,7 @@ class PDFForgeryChecker:
                 self.check_object_order(),
                 self.check_annotations_and_forms(),
                 self.check_layers(),
+                self.detect_text_modifications(),
             ]
 
             # Process overlap detection separately
