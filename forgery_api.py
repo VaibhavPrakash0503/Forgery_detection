@@ -600,7 +600,7 @@ class PDFForgeryChecker:
             pass
 
     def detect_text_modifications(self) -> Tuple[int, Optional[str]]:
-        """Detect signs of text being added or modified after document creation"""
+        """Detect signs of text being added based on font frequency analysis"""
         try:
             suspicious_pages = []
             indicators = []
@@ -609,76 +609,111 @@ class PDFForgeryChecker:
                 page = self.doc[page_num]
                 blocks = page.get_text("dict").get("blocks", [])
 
-                font_data = []
+                font_usage = {}  # Track how many times each font is used
+                font_details = {}  # Track size/color for each font
 
                 for block in blocks:
                     if block.get("type") == 0:  # Text block
                         for line in block.get("lines", []):
                             for span in line.get("spans", []):
-                                font_data.append(
-                                    {
-                                        "font": span.get("font", ""),
-                                        "size": span.get("size", 0),
-                                        "color": span.get("color", 0),
-                                    }
-                                )
+                                font = span.get("font", "")
+                                size = span.get("size", 0)
+                                color = span.get("color", 0)
 
-                if len(font_data) < 2:
+                                # Count font usage
+                                if font:
+                                    font_usage[font] = font_usage.get(font, 0) + 1
+
+                                    # Store details for analysis
+                                    if font not in font_details:
+                                        font_details[font] = {"sizes": [], "colors": []}
+                                    font_details[font]["sizes"].append(size)
+                                    font_details[font]["colors"].append(color)
+
+                if not font_usage:
                     continue
 
-                # Extract fonts and sizes
-                fonts = [f["font"] for f in font_data]
-                sizes = [f["size"] for f in font_data if f["size"] > 0]
-                colors = [f["color"] for f in font_data]
-
                 page_suspicious = False
+                total_font_instances = sum(font_usage.values())
 
-                # Check 1: Font diversity (lowered threshold)
-                unique_fonts = set(fonts)
-                if len(unique_fonts) > 3:  # Changed from 4
+                # Analysis 1: Rare fonts (used very few times)
+                rare_fonts = []
+                for font, count in font_usage.items():
+                    usage_percentage = (count / total_font_instances) * 100
+                    if (
+                        usage_percentage < 5 and count <= 3
+                    ):  # Less than 5% usage, max 3 times
+                        rare_fonts.append((font, count))
+
+                if rare_fonts:
                     page_suspicious = True
+                    font_names = [
+                        f"{font} (used {count}x)" for font, count in rare_fonts
+                    ]
                     indicators.append(
-                        f"Page {page_num + 1}: {len(unique_fonts)} different fonts"
+                        f"Page {page_num + 1}: Rare font usage detected - {', '.join(font_names)}"
                     )
 
-                # Check 2: Single-use fonts (very suspicious for edits)
-                font_counts = {}
-                for font in fonts:
-                    font_counts[font] = font_counts.get(font, 0) + 1
-
-                single_use_fonts = [f for f, count in font_counts.items() if count == 1]
-                if len(single_use_fonts) >= 1:  # Even 1 single-use font is suspicious
+                # Analysis 2: Font diversity ratio
+                unique_font_count = len(font_usage)
+                if unique_font_count > 5:  # More than 5 different fonts on one page
                     page_suspicious = True
                     indicators.append(
-                        f"Page {page_num + 1}: Font used only once (likely added text)"
+                        f"Page {page_num + 1}: High font diversity ({unique_font_count} fonts)"
                     )
 
-                # Check 3: Font size variance
-                if len(sizes) > 3:
-                    avg_size = sum(sizes) / len(sizes)
-                    # Check for ANY size that differs significantly
-                    for size in sizes:
-                        if abs(size - avg_size) > avg_size * 0.30:  # Lowered from 0.4
-                            page_suspicious = True
-                            indicators.append(
-                                f"Page {page_num + 1}: Inconsistent font size detected"
-                            )
-                            break
+                # Analysis 3: Outlier fonts (dominant font vs rare fonts)
+                if len(font_usage) >= 2:
+                    sorted_fonts = sorted(
+                        font_usage.items(), key=lambda x: x[1], reverse=True
+                    )
+                    dominant_font_count = sorted_fonts[0][1]
 
-                # Check 4: Color inconsistencies (added text often has different color value)
-                unique_colors = set(colors)
-                if len(unique_colors) > 2:  # More than 2 colors
-                    page_suspicious = True
-                    indicators.append(f"Page {page_num + 1}: Multiple text colors")
+                    # Check if there's a big gap between dominant and rare fonts
+                    outliers = [
+                        (font, count)
+                        for font, count in sorted_fonts[1:]
+                        if count
+                        < dominant_font_count * 0.1  # Less than 10% of dominant
+                    ]
+
+                    if len(outliers) >= 2:
+                        page_suspicious = True
+                        indicators.append(
+                            f"Page {page_num + 1}: {len(outliers)} outlier fonts detected"
+                        )
+
+                # Analysis 4: Single-character fonts (very suspicious)
+                for font, count in font_usage.items():
+                    if count == 1:
+                        page_suspicious = True
+                        indicators.append(
+                            f"Page {page_num + 1}: Font '{font}' used only once (highly suspicious)"
+                        )
+                        break
+
+                # Analysis 5: Font with inconsistent properties
+                for font, details in font_details.items():
+                    sizes = details["sizes"]
+                    colors = details["colors"]
+
+                    # Same font but multiple sizes (sign of copy-paste from different source)
+                    if len(set(sizes)) > 2 and font_usage[font] < 10:
+                        page_suspicious = True
+                        indicators.append(
+                            f"Page {page_num + 1}: Font '{font}' has inconsistent sizes"
+                        )
+                        break
 
                 if page_suspicious:
                     suspicious_pages.append(page_num + 1)
 
             if suspicious_pages:
                 suspicion = min(
-                    len(suspicious_pages) * 2, 6
-                )  # 2 points per page, max 6
-                message = f"Text modifications detected on page(s) {suspicious_pages}: {'; '.join(set(indicators))}"
+                    len(suspicious_pages) * 2, 8
+                )  # 2 points per page, max 8
+                unique_indicators = list(set(indicators))
+                message = f"Text modifications detected on {len(suspicious_pages)} page(s): {'; '.join(unique_indicators[:3])}"
                 return suspicion, message
 
             return 0, None
