@@ -171,12 +171,53 @@ class PDFForgeryChecker:
         try:
             total_objects = self.doc.xref_length()
             num_pages = len(self.doc)
-            obj_per_page = total_objects / num_pages if num_pages else 0
+            if num_pages == 0:
+                return 0, None
 
-            if obj_per_page > 50:
-                return 1, "high_object_density"
-            elif obj_per_page > 20:
-                return 0, "moderate_object_density"
+            obj_per_page = total_objects / num_pages
+
+            # Analyze VISIBLE content to calculate expected baseline
+            suspicious_indicators = 0
+
+            # Sample first page to estimate expected objects
+            if num_pages > 0:
+                sample_page = self.doc[0]
+
+                images = len(sample_page.get_images())
+                links = len(sample_page.get_links())
+
+                # Get text blocks properly
+                page_dict = sample_page.get_text("dict")
+                text_blocks = (
+                    len(page_dict.get("blocks", []))
+                    if isinstance(page_dict, dict)
+                    else 0
+                )
+
+                # Calculate expected objects based on visible content
+                expected_objs = (
+                    images * 5  # Images with masks/filters = ~5 objects
+                    + links * 4  # Links/annotations = ~4 objects
+                    + text_blocks * 2  # Text blocks = ~2 objects
+                    + 15  # Base (page structure, fonts, resources)
+                )
+
+                # Only flag if SIGNIFICANTLY exceeds expected
+                if obj_per_page > expected_objs * 3:  # 3x more than expected
+                    suspicious_indicators += 1
+
+            # MUCH higher thresholds for absolute density
+            if obj_per_page > 500:  # Extremely abnormal
+                return 8, "extremely_high_object_density"
+            elif obj_per_page > 300:  # Very unusual
+                return 6, "very_high_object_density"
+            elif obj_per_page > 150 and suspicious_indicators > 0:
+                # High density AND unexplained objects
+                return 5, "suspicious_object_density"
+            elif obj_per_page > 200:
+                # High but might be legitimate (complex forms/graphics)
+                return 3, "high_object_density"
+
             return 0, None
         except Exception:
             return 0, None
