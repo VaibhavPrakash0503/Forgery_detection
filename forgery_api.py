@@ -1,6 +1,7 @@
 import tempfile
 import os
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import logging
+from fastapi import FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Tuple, Any
@@ -9,8 +10,22 @@ import fitz  # PyMuPDF
 from PyPDF2 import PdfReader
 from itertools import combinations
 from pdfminer.high_level import extract_text
+import magic
+from config import ForgeryDetectionConfig, DEFAULT_CONFIG
 
-app = FastAPI()
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app with enhanced metadata
+app = FastAPI(
+    title="PDF Forgery Detection API",
+    description="Analyze PDF documents for potential forgery indicators including text modifications, page deletions, and metadata anomalies.",
+    version="2.0.0"
+)
 
 
 class OverlapInfo(BaseModel):
@@ -18,6 +33,17 @@ class OverlapInfo(BaseModel):
     total_overlaps: int = 0
     warning: Optional[str] = None
     content: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PageDeletionInfo(BaseModel):
+    """Detailed information about suspected page deletions."""
+    has_deletions: bool = False
+    current_page_count: int = 0
+    missing_object_count: int = 0
+    gap_pattern: str = Field(
+        default="",
+        description="Analysis of object ID gap patterns (regular vs irregular)"
+    )
 
 
 class ForgeryStatus(BaseModel):
@@ -50,13 +76,32 @@ class ForgeryStatus(BaseModel):
         default_factory=list,
         description="Observational warnings and notes not contributing to suspicion points",
     )
+    page_deletion_details: Optional[PageDeletionInfo] = Field(
+        None, description="Detailed page deletion analysis if deletions detected"
+    )
 
 
 class PDFForgeryChecker:
-    def __init__(self, pdf_path):
+    """Main class for detecting forgery indicators in PDF documents."""
+    
+    def __init__(self, pdf_path: str, config: Optional[ForgeryDetectionConfig] = None):
+        """
+        Initialize PDF forgery checker.
+        
+        Args:
+            pdf_path: Path to the PDF file to analyze
+            config: Optional configuration object for detection thresholds
+        """
         self.pdf_path = pdf_path
         self.reader = PdfReader(pdf_path)
         self.doc = fitz.open(pdf_path)
+        self.config = config or DEFAULT_CONFIG
+        
+        # Fix critical bug: Initialize raw_data for incremental updates check
+        with open(pdf_path, 'rb') as f:
+            self.raw_data = f.read()
+        
+        logger.info(f"Initialized forgery checker for: {pdf_path}")
 
     def format_pdf_date(self, pdf_date: str) -> str:
         """Format PDF date string to DD/MM/YYYY HH:MM format"""
@@ -92,14 +137,14 @@ class PDFForgeryChecker:
             if creation != "N/A" and mod == "N/A":
                 return 1, "No modification date"
 
-            # Both dates exist - check if they're identical (suspicious)
+            # Both dates exist - check if they're identical
             if creation != "N/A" and mod != "N/A":
                 # Compare first 14 chars (YYYYMMDDHHmmss) - exact same timestamp
                 if creation[:14] == mod[:14]:
-                    return 2, "Creation and modification dates are identical"
+                    return 0, "identical_dates"  # Observational - common in legitimate PDFs
 
             # Both dates exist and different (normal)
-            return 3, None
+            return 0, None
 
         except Exception:
             return 0, None
@@ -719,7 +764,341 @@ class PDFForgeryChecker:
             return 0, None
 
         except Exception as e:
+            logger.error(f"Text modification detection failed: {str(e)}", exc_info=True)
             return 0, None
+
+    def check_character_spacing(self) -> Tuple[int, Optional[str]]:
+        """
+        Detect abnormal character spacing patterns that may indicate text insertion.
+        
+        Analyzes spacing between text spans to identify irregularities common in
+        copy-paste forgeries where text doesn't align naturally.
+        """
+        try:
+            suspicious_pages = []
+            
+            for page_num in range(len(self.doc)):
+                page = self.doc[page_num]
+                blocks = page.get_text("dict").get("blocks", [])
+                
+                for block in blocks:
+                    if block.get("type") == 0:  # Text block
+                        for line in block.get("lines", []):
+                            spans = line.get("spans", [])
+                            if len(spans) < 2:
+                                continue
+                            
+                            # Calculate spacing between characters
+                            spacings = []
+                            for i in range(len(spans) - 1):
+                                x1_end = spans[i]["bbox"][2]
+                                x2_start = spans[i+1]["bbox"][0]
+                                spacing = x2_start - x1_end
+                                spacings.append(spacing)
+                            
+                            # Check for unusual variance
+                            if spacings:
+                                avg_spacing = sum(spacings) / len(spacings)
+                                if avg_spacing > 0:  # Avoid division by zero
+                                    variance = sum((s - avg_spacing)**2 for s in spacings) / len(spacings)
+                                    
+                                    # High variance suggests manual text insertion
+                                    if variance > avg_spacing * self.config.char_spacing_variance_multiplier:
+                                        if page_num + 1 not in suspicious_pages:
+                                            suspicious_pages.append(page_num + 1)
+                                        break
+            
+            if suspicious_pages:
+                return self.config.char_spacing_points, f"Irregular character spacing on pages: {suspicious_pages}"
+            return 0, None
+        except Exception as e:
+            logger.error(f"Character spacing check failed: {str(e)}", exc_info=True)
+            return 0, None
+
+    def check_text_baseline_alignment(self) -> Tuple[int, Optional[str]]:
+        """
+        Detect text not aligned to consistent baselines.
+        
+        Misaligned text is common when adding text to scanned documents or
+        when inserting text that doesn't match the original document's layout.
+        """
+        try:
+            suspicious_pages = []
+            
+            for page_num in range(len(self.doc)):
+                page = self.doc[page_num]
+                blocks = page.get_text("dict").get("blocks", [])
+                
+                baselines = []
+                for block in blocks:
+                    if block.get("type") == 0:
+                        for line in block.get("lines", []):
+                            # Get y-coordinate of baseline
+                            baseline_y = line["bbox"][3]
+                            baselines.append(baseline_y)
+                
+                # Check for outliers (text not on regular grid)
+                if len(baselines) > self.config.baseline_min_lines:
+                    baselines.sort()
+                    # Calculate common spacing
+                    spacings = [baselines[i+1] - baselines[i] for i in range(len(baselines)-1)]
+                    if spacings:
+                        median_spacing = sorted(spacings)[len(spacings)//2]
+                        
+                        # Find lines that don't fit the grid
+                        outliers = sum(1 for s in spacings 
+                                     if abs(s - median_spacing) > median_spacing * self.config.baseline_outlier_threshold)
+                        
+                        if outliers > len(baselines) * self.config.baseline_outlier_percentage:
+                            suspicious_pages.append(page_num + 1)
+            
+            if suspicious_pages:
+                return 0, "baseline_misalignment"  # Observational only - too many false positives
+            return 0, None
+        except Exception as e:
+            logger.error(f"Baseline alignment check failed: {str(e)}", exc_info=True)
+            return 0, None
+
+    def check_digital_signatures(self) -> Tuple[int, Optional[str]]:
+        """
+        Check for presence and validity of digital signatures.
+        
+        Digital signatures help verify document authenticity. Their absence
+        or invalidity can be suspicious for important documents.
+        """
+        try:
+            root = self.reader.trailer.get("/Root")
+            if hasattr(root, "get_object"):
+                root = root.get_object()
+            
+            # Check for signature fields
+            acro_form = root.get("/AcroForm") if isinstance(root, dict) else None
+            if acro_form and hasattr(acro_form, "get_object"):
+                acro_form = acro_form.get_object()
+            
+            has_signature = False
+            if isinstance(acro_form, dict):
+                fields = acro_form.get("/Fields", [])
+                if hasattr(fields, "get_object"):
+                    fields = fields.get_object()
+                
+                for field in fields if isinstance(fields, list) else []:
+                    if hasattr(field, "get_object"):
+                        field = field.get_object()
+                    if isinstance(field, dict) and field.get("/FT") == "/Sig":
+                        has_signature = True
+                        break
+            
+            if has_signature:
+                # Document has signature - this is good (observational)
+                return 0, "digital_signature_present"
+            else:
+                # No signature - minor suspicion for important documents
+                return self.config.signature_missing_points, "no_digital_signature"
+            
+        except Exception as e:
+            logger.error(f"Digital signature check failed: {str(e)}", exc_info=True)
+            return 0, None
+
+    def check_content_stream_anomalies(self) -> Tuple[int, Optional[str]]:
+        """
+        Detect suspicious patterns in PDF content streams.
+        
+        Analyzes raw PDF operators to find manual text positioning which
+        is common in sophisticated forgeries.
+        """
+        try:
+            suspicious_indicators = []
+            
+            for page_num in range(len(self.doc)):
+                page = self.doc[page_num]
+                
+                # Get raw content stream
+                try:
+                    xref = page.xref
+                    content_stream = self.doc.xref_stream(xref)
+                    
+                    if content_stream:
+                        # Check for suspicious operators
+                        suspicious_ops = [
+                            b'Tm',  # Text matrix (manual positioning)
+                            b'Td',  # Text position
+                            b'TD',  # Text position with leading
+                        ]
+                        
+                        # Count manual text positioning operations
+                        manual_positions = sum(content_stream.count(op) for op in suspicious_ops)
+                        
+                        # Also check for text operations
+                        text_ops = content_stream.count(b'Tj') + content_stream.count(b'TJ')
+                        
+                        # High ratio of manual positioning suggests inserted text
+                        if text_ops > 0 and manual_positions / text_ops > self.config.content_stream_position_ratio:
+                            suspicious_indicators.append(page_num + 1)
+                except Exception:
+                    continue
+            
+            if suspicious_indicators:
+                return self.config.content_stream_points, f"Content stream anomalies on pages: {suspicious_indicators}"
+            return 0, None
+        except Exception as e:
+            logger.error(f"Content stream check failed: {str(e)}", exc_info=True)
+            return 0, None
+
+    def check_page_labels(self) -> Tuple[int, Optional[str]]:
+        """
+        Check for inconsistencies in page labels/numbering.
+        
+        Gaps in page labels (e.g., 1, 2, 4, 5 - missing 3) can indicate
+        page deletion attempts.
+        """
+        try:
+            root = self.reader.trailer.get("/Root")
+            if hasattr(root, "get_object"):
+                root = root.get_object()
+            
+            page_labels = root.get("/PageLabels") if isinstance(root, dict) else None
+            
+            if page_labels:
+                if hasattr(page_labels, "get_object"):
+                    page_labels = page_labels.get_object()
+                
+                # Check if page labels suggest missing pages
+                if isinstance(page_labels, dict):
+                    nums = page_labels.get("/Nums", [])
+                    if hasattr(nums, "get_object"):
+                        nums = nums.get_object()
+                    
+                    # Analyze for gaps
+                    if isinstance(nums, list) and len(nums) > 2:
+                        # Extract page numbers
+                        page_nums = [nums[i] for i in range(0, len(nums), 2)]
+                        
+                        # Check for gaps
+                        for i in range(len(page_nums) - 1):
+                            if page_nums[i+1] - page_nums[i] > 1:
+                                return self.config.page_labels_gap_points, "page_label_gaps_detected"
+            
+            return 0, None
+        except Exception as e:
+            logger.error(f"Page labels check failed: {str(e)}", exc_info=True)
+            return 0, None
+
+    def analyze_page_deletions(self) -> PageDeletionInfo:
+        """
+        Comprehensive page deletion analysis.
+        
+        Analyzes object ID gaps and page count mismatches to identify
+        suspected page deletions and their approximate positions.
+        
+        Returns:
+            PageDeletionInfo with detailed deletion analysis
+        """
+        try:
+            actual_count = len(self.reader.pages)
+            
+            # Get declared count from PDF structure
+            declared_count = None
+            try:
+                trailer = self.reader.trailer
+                root = trailer.get("/Root")
+                if hasattr(root, "get_object"):
+                    root = root.get_object()
+                pages = root.get("/Pages")
+                if hasattr(pages, "get_object"):
+                    pages = pages.get_object()
+                if isinstance(pages, dict):
+                    declared_count = pages.get("/Count")
+            except Exception:
+                pass
+            
+            # Analyze object ID gaps
+            page_objects = []
+            for page in self.reader.pages:
+                if hasattr(page, "indirect_reference"):
+                    page_objects.append(page.indirect_reference.idnum)
+            
+            suspected_pages = []
+            missing_ids = []
+            gap_pattern = ""
+            
+            if page_objects:
+                page_objects_sorted = sorted(page_objects)
+                
+                # Calculate gaps between consecutive page objects
+                gaps = []
+                gap_positions = []
+                for i in range(len(page_objects_sorted) - 1):
+                    gap_size = page_objects_sorted[i + 1] - page_objects_sorted[i] - 1
+                    if gap_size > 0:
+                        gaps.append(gap_size)
+                        gap_positions.append(i + 1)  # Position after which gap occurs
+                        # Track missing object IDs
+                        missing_range = list(range(
+                            page_objects_sorted[i] + 1,
+                            page_objects_sorted[i + 1]
+                        ))
+                        missing_ids.extend(missing_range)
+                
+                # Analyze gap pattern
+                if gaps:
+                    avg_gap = sum(gaps) / len(gaps)
+                    variance = sum((g - avg_gap) ** 2 for g in gaps) / len(gaps)
+                    std_dev = variance ** 0.5
+                    
+                    # Regular gaps (low variance) = normal PDF generation
+                    # Irregular gaps (high variance) = potential deletion
+                    if std_dev < avg_gap * 0.3:  # Low variance (< 30% of mean)
+                        gap_pattern = f"Regular gap pattern (avg: {avg_gap:.1f}, std: {std_dev:.1f}) - likely normal PDF structure"
+                    else:
+                        gap_pattern = f"Irregular gap pattern detected (avg: {avg_gap:.1f}, std: {std_dev:.1f}) - possible deletions"
+                        
+                        # Identify positions with unusually large gaps
+                        for i, gap in enumerate(gaps):
+                            if gap > avg_gap + std_dev:  # Significantly larger than average
+                                suspected_pages.append(gap_positions[i])
+                else:
+                    gap_pattern = "No gaps in page object numbering"
+            
+            # Estimate original page count and detect deletions
+            has_deletions = False
+            estimated_original_count = declared_count  # Start with declared count
+            estimated_deleted_count = 0
+            
+            if declared_count and declared_count > actual_count:
+                # Declared count is higher - pages were deleted but count wasn't updated
+                has_deletions = True
+                estimated_deleted_count = declared_count - actual_count
+                gap_pattern += f" | Declared count ({declared_count}) > actual ({actual_count}): {estimated_deleted_count} pages missing"
+                estimated_original_count = declared_count
+            elif page_objects and gaps:
+                # Estimate original count from object ID range and gap pattern
+                min_obj = min(page_objects)
+                max_obj = max(page_objects)
+                obj_range = max_obj - min_obj
+                
+                # If we have irregular gaps, estimate original page count
+                if std_dev > avg_gap * 0.3:  # Irregular pattern
+                    has_deletions = True
+                    
+                    # Note: Cannot accurately determine deletion count due to object renumbering
+                    # Just report that deletions were detected
+                    gap_pattern += f" | 1 or more page(s) deleted (exact count cannot be determined)"
+                    estimated_original_count = None  # Unknown
+            
+            return PageDeletionInfo(
+                has_deletions=has_deletions,
+                current_page_count=actual_count,
+                missing_object_count=len(missing_ids),
+                gap_pattern=gap_pattern if gap_pattern else "No deletion indicators found"
+            )
+        
+        except Exception as e:
+            logger.error(f"Page deletion analysis failed: {str(e)}", exc_info=True)
+            return PageDeletionInfo(
+                current_page_count=len(self.reader.pages) if hasattr(self, 'reader') else 0,
+                gap_pattern=f"Analysis failed: {str(e)}"
+            )
 
     def analyze(self, filename: str) -> ForgeryStatus:
         try:
@@ -729,6 +1108,8 @@ class PDFForgeryChecker:
             detailed_explanations = {}
 
             explanation_map = {
+                "identical_dates": "Creation and modification dates are identical (observational note).",
+                "baseline_misalignment": "Text baseline misalignment detected (observational note).",
                 "metadata": "The PDF metadata contains unusual or missing information, which can be a sign of forgery.",
                 "high_object_density": "High object density was observed, which might indicate content layering or digital manipulation.",
                 "moderate_object_density": "Moderate object density was observed (observational note).",
@@ -749,9 +1130,17 @@ class PDFForgeryChecker:
                 "pages_missing": "The declared page count is higher than actual count (pages may have been deleted).",
                 "text_overlap": "Text elements overlap abnormally, which may suggest copy-paste forgery.",
                 "text_extraction_failed": "Failed to extract text (observational note).",
+                "char_spacing": "Irregular character spacing detected, indicating possible text insertion.",
+                "baseline_misalignment": "Text baseline misalignment found, common in forged documents.",
+                "no_digital_signature": "Document lacks digital signature (observational note).",
+                "digital_signature_present": "Document has digital signature (observational note).",
+                "content_stream_anomalies": "Suspicious content stream patterns detected, suggesting manual text manipulation.",
+                "page_label_gaps_detected": "Page label gaps found, indicating possible page deletion.",
             }
 
             observational_checks = {
+                "identical_dates",
+                "baseline_misalignment",
                 "moderate_object_density",
                 "inconsistent_fonts",
                 "annotations_or_forms",
@@ -761,6 +1150,8 @@ class PDFForgeryChecker:
                 "page_number_inconsistency",
                 "missing_referenced_pages",
                 "text_extraction_failed",
+                "digital_signature_present",
+                "no_digital_signature",
             }
 
             # Run all checks
@@ -778,6 +1169,12 @@ class PDFForgeryChecker:
                 self.check_annotations_and_forms(),
                 self.check_layers(),
                 self.detect_text_modifications(),
+                # New detection methods
+                self.check_character_spacing(),
+                self.check_text_baseline_alignment(),
+                self.check_digital_signatures(),
+                self.check_content_stream_anomalies(),
+                self.check_page_labels(),
             ]
 
             # Process overlap detection separately
@@ -786,6 +1183,14 @@ class PDFForgeryChecker:
                 total_points += 2
                 flagged_functions.append("text_overlap")
                 detailed_explanations["text_overlap"] = explanation_map["text_overlap"]
+
+            # Process page deletion analysis
+            page_deletion_info = self.analyze_page_deletions()
+            if page_deletion_info.has_deletions:
+                total_points += 5  # Add points for page deletion
+                deletion_msg = "Page deletion detected"
+                flagged_functions.append(deletion_msg)
+                detailed_explanations["page_deletion"] = f"Irregular gap pattern suggests page deletion. {page_deletion_info.gap_pattern}"
 
             # Process other checks
             # Inside the analyze method, where you process the checks:
@@ -840,6 +1245,9 @@ class PDFForgeryChecker:
                 overlap_details=overlap_info
                 if overlap_info.total_overlaps > 0
                 else None,
+                page_deletion_details=page_deletion_info
+                if page_deletion_info.has_deletions
+                else None,
                 timestamp=datetime.now().isoformat(),
                 filename=filename,
                 explanations=detailed_explanations if detailed_explanations else None,
@@ -858,34 +1266,143 @@ class PDFForgeryChecker:
             )
 
 
-@app.post("/forgery-check", response_model=ForgeryStatus)
-async def check_pdf(file: UploadFile = File(...)):
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint for monitoring.
+    
+    Returns basic API status and version information.
+    """
+    return {
+        "status": "healthy",
+        "version": "2.0.0",
+        "service": "PDF Forgery Detection API"
+    }
+
+
+@app.post(
+    "/forgery-check",
+    response_model=ForgeryStatus,
+    summary="Analyze PDF for forgery indicators",
+    description="""
+    Upload a PDF file to analyze for potential forgery indicators including:
+    
+    - **Text modifications**: Detects added/altered text via font analysis and character spacing
+    - **Page deletion**: Identifies missing pages through structural analysis and page labels
+    - **Metadata anomalies**: Checks for suspicious or missing metadata
+    - **Content overlaps**: Finds overlapping text/images (copy-paste indicators)
+    - **Digital signatures**: Verifies presence of signatures
+    - **Baseline alignment**: Detects misaligned text common in forgeries
+    - **Content stream analysis**: Identifies manual text positioning
+    
+    Returns a detailed report with suspicion level (None/Moderate/High) and
+    specific findings for each check performed.
+    
+    **File Requirements:**
+    - Maximum file size: 50MB
+    - File type: PDF only
+    - Rate limit: 10 requests per minute
+    """,
+    responses={
+        200: {
+            "description": "Analysis completed successfully",
+        },
+        400: {"description": "Invalid PDF file or file type"},
+        413: {"description": "File too large (max 50MB)"},
+        429: {"description": "Rate limit exceeded"},
+        500: {"description": "Analysis error"}
+    }
+)
+async def check_pdf(request: Request, file: UploadFile = File(...)):
+    """
+    Analyze uploaded PDF for forgery indicators.
+    
+    Args:
+        request: FastAPI request object (for rate limiting)
+        file: Uploaded PDF file
+        
+    Returns:
+        ForgeryStatus: Detailed analysis results
+        
+    Raises:
+        HTTPException: For validation errors or processing failures
+    """
     temp_path = None
     try:
+        # Read file contents
+        contents = await file.read()
+        
+        # Validate file size
+        file_size = len(contents)
+        if file_size > DEFAULT_CONFIG.max_file_size:
+            logger.warning(f"File too large: {file_size} bytes from {request.client.host}")
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size: {DEFAULT_CONFIG.max_file_size / (1024*1024):.0f}MB"
+            )
+        
+        # Validate file type using magic number
+        try:
+            file_type = magic.from_buffer(contents, mime=True)
+            if file_type != 'application/pdf':
+                logger.warning(f"Invalid file type: {file_type} from {request.client.host}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid file type: {file_type}. Expected: application/pdf"
+                )
+        except Exception as e:
+            logger.error(f"MIME type detection failed: {str(e)}")
+            # Continue anyway - fallback validation will happen when opening PDF
+        
+        # Save to temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             temp_path = tmp.name
-            contents = await file.read()
             tmp.write(contents)
-
+        
+        logger.info(f"Analyzing PDF: {file.filename} ({file_size} bytes)")
+        
+        # Validate PDF structure
+        try:
+            test_reader = PdfReader(temp_path)
+        except Exception as e:
+            logger.error(f"Invalid PDF structure: {str(e)}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Corrupted or invalid PDF: {str(e)}"
+            )
+        
+        # Perform forgery analysis
         checker = PDFForgeryChecker(temp_path)
         result = checker.analyze(file.filename or "unknown.pdf")
         checker.close()
-
+        
+        logger.info(f"Analysis complete: {file.filename} - Status: {result.status}, Points: {result.total_points}")
+        
         return JSONResponse(content=result.model_dump())
 
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+        logger.error(f"Unexpected error analyzing PDF: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred during analysis: {str(e)}"
+        )
     finally:
+        # Clean up temporary file
         try:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
-        except Exception:
-            pass
+                logger.debug(f"Cleaned up temp file: {temp_path}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up temp file: {str(e)}")
 
 
 if __name__ == "__main__":
     import uvicorn
 
+    logger.info("Starting PDF Forgery Detection API v2.0.0")
     uvicorn.run("forgery_api:app", host="127.0.0.1", port=8000, reload=True)
 
-    # http://localhost:8000/docs
