@@ -108,7 +108,11 @@ class ForgeryDetectionConfig:
     
     # API security
     max_file_size: int = 50 * 1024 * 1024  # 50MB
-    rate_limit: str = "10/minute"
+    
+    # Logging configuration
+    log_level: str = "INFO"
+    log_format: str = "json"  # json or text
+    log_file: Optional[str] = None
     
     @classmethod
     def from_env(cls) -> "ForgeryDetectionConfig":
